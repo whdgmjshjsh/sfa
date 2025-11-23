@@ -1,6 +1,10 @@
 package pku;
 
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Set;
 
 import pascal.taie.ir.IR;
 import pascal.taie.ir.exp.IntLiteral;
@@ -13,12 +17,12 @@ import java.util.Map;
 
 public class PreprocessResult {
 
-    public final Map<New, Integer> obj_ids;
-    public final Map<Integer, Var> test_pts;
+    public final Map<New, Set<Integer>> obj_ids;
+    public final Map<Integer, Set<Var>> test_pts;
 
     public PreprocessResult() {
-        obj_ids = new HashMap<New, Integer>();
-        test_pts = new HashMap<Integer, Var>();
+        obj_ids = new HashMap<>();
+        test_pts = new HashMap<>();
     }
 
     /**
@@ -29,7 +33,7 @@ public class PreprocessResult {
      * @param id   id of the object allocated
      */
     public void alloc(New stmt, int id) {
-        obj_ids.put(stmt, id);
+        obj_ids.computeIfAbsent(stmt, k -> new HashSet<>()).add(id);
     }
 
     /**
@@ -39,7 +43,7 @@ public class PreprocessResult {
      * @param v  the pointer/variable
      */
     public void test(int id, Var v) {
-        test_pts.put(id, v);
+        test_pts.computeIfAbsent(id, k -> new HashSet<>()).add(v);
     }
 
     /**
@@ -47,16 +51,16 @@ public class PreprocessResult {
      * @param stmt statement that allocates a new object
      * @return id of the object allocated
      */
-    public int getObjIdAt(New stmt) {
-        return obj_ids.get(stmt);
+    public Set<Integer> getObjIdAt(New stmt) {
+        return obj_ids.getOrDefault(stmt, Set.of());
     }
 
     /**
      * @param id
-     * @return the pointer/variable in Benchmark.test(id, var);
+     * @return the pointers/variables in Benchmark.test(id, var);
      */
-    public Var getTestPt(int id) {
-        return test_pts.get(id);
+    public Set<Var> getTestPt(int id) {
+        return test_pts.getOrDefault(id, Set.of());
     }
 
     /**
@@ -66,7 +70,7 @@ public class PreprocessResult {
      */
     public void analysis(IR ir) {
         var stmts = ir.getStmts();
-        Integer id = 0;
+        Deque<Integer> pendingAllocs = new ArrayDeque<>();
         for (var stmt : stmts) {
 
             if (stmt instanceof Invoke) {
@@ -80,7 +84,7 @@ public class PreprocessResult {
                         if (methodName.equals("alloc")) {
                             var lit = exp.getArg(0).getConstValue();
                             assert lit instanceof IntLiteral;
-                            id = ((IntLiteral) lit).getNumber();
+                            pendingAllocs.addLast(((IntLiteral) lit).getNumber());
                         } else if (methodName.equals("test")) {
                             var lit = exp.getArg(0).getConstValue();
                             assert lit instanceof IntLiteral;
@@ -92,9 +96,10 @@ public class PreprocessResult {
 
                 }
             } else if (stmt instanceof New) {
-                if (id != 0) {// ignore unlabeled `new` stmts
-                    this.alloc((New) stmt, id);
-                    id = 0;
+                if (!pendingAllocs.isEmpty()) {
+                    var n = (New) stmt;
+                    pendingAllocs.forEach(id -> this.alloc(n, id));
+                    pendingAllocs.clear();
                 }
             }
         }

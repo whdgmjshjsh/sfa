@@ -43,9 +43,10 @@ public class PointerAnalysisTrivial extends ProgramAnalysis<PointerAnalysisResul
             });
         });
 
-        var objs = new TreeSet<>(preprocess.obj_ids.values());
+        var objs = new TreeSet<Integer>();
+        preprocess.obj_ids.values().forEach(objs::addAll);
 
-        preprocess.test_pts.forEach((test_id, pt)->{
+        preprocess.test_pts.forEach((test_id, pts)->{
             result.put(test_id, objs);
         });
 

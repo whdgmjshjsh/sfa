@@ -17,6 +17,15 @@
 - Local scoring with the provided judge (Docker required):  
   `cd judge && ./run_jar.sh` after placing your jar at `judge/user/submission_jar/submission.jar` (delete `result.json` to re-run).
 
+  ```bash
+  cd Tai-e
+  GRADLE_USER_HOME=$(pwd)/.gradle-local ./gradlew fatJar
+  cp build/tai-e-all-0.5.1-SNAPSHOT.jar ../judge/user/submission_jar/submission.jar
+  cd ../judge
+  bash ./run_jar.sh
+  rm -rf ./user/submission_jar/result.json
+  ```
+
 ## Coding Style & Naming Conventions
 - Java style mirrors existing sources: 4-space indentation, braces on the same line, CamelCase types, lowerCamelCase fields/locals, and uppercase snake for constants.
 - Keep code in package `pku` for student logic; reuse framework utilities in `pascal.taie` instead of duplicating helpers.
@@ -36,3 +45,6 @@
 ## Security & Configuration Tips
 - Ensure Java 17 is active (`java -version`) before building; Gradle wrapper handles dependencies offline after initial download.
 - Judge containers run with `--network none`; avoid code paths that require external resources. Keep memory use under 6g and avoid spawning large process trees (`--pids-limit 256`).
+
+## References
+- The `Reference` folder contains source files (src_1/ and src_2/) that can be used as implementation examples.

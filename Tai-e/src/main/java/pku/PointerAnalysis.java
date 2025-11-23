@@ -118,6 +118,8 @@ public class PointerAnalysis extends PointerAnalysisTrivial {
         private final Map<FieldSlot, Set<New>> fieldPointsTo = new HashMap<>();
         private final Map<FieldRef, Set<New>> staticFieldPointsTo = new HashMap<>();
         private final Set<New> allAllocs = new HashSet<>();
+        private final Map<Type, Set<New>> allAllocsByType = new HashMap<>();
+        private final Set<Var> conservativeVars = new HashSet<>();
 
         PointsToSolver(ClassHierarchy classHierarchy,
                        TypeSystem typeSystem,
@@ -151,6 +153,11 @@ public class PointerAnalysis extends PointerAnalysisTrivial {
                 addVarPoints(n.getLValue(), n);
                 allAllocs.add(n);
             });
+            // Pre-compute a fast lookup for type-based fallbacks.
+            for (New obj : allAllocs) {
+                Type objType = obj.getRValue().getType();
+                allAllocsByType.computeIfAbsent(objType, k -> new HashSet<>()).add(obj);
+            }
 
             boolean changed;
             do {
@@ -163,6 +170,11 @@ public class PointerAnalysis extends PointerAnalysisTrivial {
                 changed |= processLoadArrays();
                 changed |= processInvokes();
             } while (changed);
+
+            // For variables involved in conservative handling, ensure they
+            // over-approximate all compatible allocations.
+            conservativeVars.forEach(v ->
+                    addAll(varPointsTo, v, allTypedAllocs(v.getType())));
 
             return buildResult();
         }
@@ -203,7 +215,7 @@ public class PointerAnalysis extends PointerAnalysisTrivial {
                 }
                 if (fa instanceof InstanceFieldAccess) {
                     InstanceFieldAccess inst = (InstanceFieldAccess) fa;
-                    for (New baseObj : getVarPoints(inst.getBase())) {
+                    for (New baseObj : candidateBases(inst.getBase())) {
                         changed |= addFieldPoints(
                                 new FieldSlot(baseObj, inst.getFieldRef()),
                                 getVarPoints(rhs));
@@ -227,7 +239,7 @@ public class PointerAnalysis extends PointerAnalysisTrivial {
                 }
                 if (fa instanceof InstanceFieldAccess) {
                     InstanceFieldAccess inst = (InstanceFieldAccess) fa;
-                    for (New baseObj : getVarPoints(inst.getBase())) {
+                    for (New baseObj : candidateBases(inst.getBase())) {
                         changed |= addAll(varPointsTo, lhs,
                                 getFieldPoints(new FieldSlot(baseObj, inst.getFieldRef())));
                     }
@@ -249,7 +261,7 @@ public class PointerAnalysis extends PointerAnalysisTrivial {
                 if (!(rhs.getType() instanceof ReferenceType)) {
                     continue;
                 }
-                for (New baseObj : getVarPoints(access.getBase())) {
+                for (New baseObj : candidateBases(access.getBase())) {
                     changed |= addArrayStore(baseObj, access.getIndex(),
                             getVarPoints(rhs));
                 }
@@ -265,7 +277,7 @@ public class PointerAnalysis extends PointerAnalysisTrivial {
                     continue;
                 }
                 ArrayAccess access = la.getArrayAccess();
-                for (New baseObj : getVarPoints(access.getBase())) {
+                for (New baseObj : candidateBases(access.getBase())) {
                     changed |= addAll(varPointsTo, lhs,
                             getArrayPoints(baseObj, access.getIndex()));
                 }
@@ -283,7 +295,10 @@ public class PointerAnalysis extends PointerAnalysisTrivial {
                     continue;
                 }
 
+                Var baseVar = invoke.isStatic() ? null : ((pascal.taie.ir.exp.InvokeInstanceExp) exp).getBase();
+                boolean hasReceiverInfo = invoke.isStatic() || !candidateBases(baseVar).isEmpty();
                 Set<JMethod> targets = resolveTargets(invoke);
+                boolean needConservative = targets.isEmpty();
                 for (JMethod target : targets) {
                     boolean isApp = target.getDeclaringClass().isApplication();
                     boolean useIR = isApp && !target.isAbstract() && !target.isNative();
@@ -298,10 +313,9 @@ public class PointerAnalysis extends PointerAnalysisTrivial {
                     }
                     if (useIR && ir != null) {
                         if (!target.isStatic()) {
-                            Var base = ((pascal.taie.ir.exp.InvokeInstanceExp) exp).getBase();
                             Var thisVar = ir.getThis();
-                            if (thisVar != null && isReference(base) && isReference(thisVar)) {
-                                changed |= addAll(varPointsTo, thisVar, getVarPoints(base));
+                            if (thisVar != null && isReference(baseVar) && isReference(thisVar)) {
+                                changed |= addAll(varPointsTo, thisVar, getVarPoints(baseVar));
                             }
                         }
                         List<Var> params = ir.getParams();
@@ -322,27 +336,24 @@ public class PointerAnalysis extends PointerAnalysisTrivial {
                             }
                         }
                     } else {
-                        Var ret = invoke.getResult();
-                        if (ret != null && isReference(ret)) {
-                            Type retType = ret.getType();
-                            Set<New> over = new HashSet<>();
-                            for (New obj : allAllocs) {
-                                if (typeCompatible(obj, retType)) {
-                                    over.add(obj);
-                                }
-                            }
-                            if (!invoke.isStatic()) {
-                                Var base = ((pascal.taie.ir.exp.InvokeInstanceExp) exp).getBase();
-                                over.addAll(filterByType(getVarPoints(base), retType));
-                            }
-                            for (Var arg : exp.getArgs()) {
-                                if (isReference(arg)) {
-                                    over.addAll(filterByType(getVarPoints(arg), retType));
-                                }
-                            }
-                            changed |= addAll(varPointsTo, ret, over);
+                        if (hasReceiverInfo || invoke.isStatic()) {
+                            needConservative = true;
                         }
                     }
+                }
+                Var ret = invoke.getResult();
+                if (ret != null && isReference(ret) && needConservative) {
+                    Set<New> over = conservativeReturn(invoke, ret);
+                    if (!over.isEmpty()) {
+                        changed |= addAll(varPointsTo, ret, over);
+                    }
+                    conservativeVars.add(ret);
+                }
+                if (needConservative) {
+                    markConservativeArgs(invoke);
+                }
+                if (needConservative) {
+                    changed |= conservativeArgs(invoke);
                 }
             }
             return changed;
@@ -362,7 +373,7 @@ public class PointerAnalysis extends PointerAnalysisTrivial {
                 return targets;
             }
             Var base = ((pascal.taie.ir.exp.InvokeInstanceExp) exp).getBase();
-            for (New obj : getVarPoints(base)) {
+            for (New obj : candidateBases(base)) {
                 Type receiverType = obj.getRValue().getType();
                 JMethod target = classHierarchy.dispatch(receiverType, exp.getMethodRef());
                 if (target != null && !target.isAbstract()) {
@@ -374,17 +385,91 @@ public class PointerAnalysis extends PointerAnalysisTrivial {
 
         private PointerAnalysisResult buildResult() {
             PointerAnalysisResult result = new PointerAnalysisResult();
-            preprocess.test_pts.forEach((id, var) -> {
+            preprocess.test_pts.forEach((id, vars) -> {
                 Set<Integer> objIds = new TreeSet<>();
-                for (New obj : getVarPoints(var)) {
-                    Integer label = preprocess.obj_ids.get(obj);
-                    if (label != null) {
-                        objIds.add(label);
+                for (Var var : vars) {
+                    Set<New> pts = varPointsTo.get(var);
+                    if (pts != null) {
+                        for (New obj : pts) {
+                            Set<Integer> labels = preprocess.obj_ids.get(obj);
+                            if (labels != null) {
+                                objIds.addAll(labels);
+                            }
+                        }
+                    }
+                    if (isReference(var) && (pts == null || pts.isEmpty() || conservativeVars.contains(var))) {
+                        preprocess.obj_ids.forEach((alloc, label) -> {
+                            if (typeCompatible(alloc, var.getType())) {
+                                objIds.addAll(label);
+                            }
+                        });
                     }
                 }
                 result.put(id, new TreeSet<>(objIds));
             });
             return result;
+        }
+
+        private Set<New> conservativeReturn(Invoke invoke, Var retVar) {
+            Set<New> over = new HashSet<>();
+            Type retType = retVar.getType();
+            over.addAll(allTypedAllocs(retType));
+            InvokeExp exp = invoke.getInvokeExp();
+            if (!invoke.isStatic()) {
+                Var base = ((pascal.taie.ir.exp.InvokeInstanceExp) exp).getBase();
+                over.addAll(filterByType(candidateBases(base), retType));
+            }
+            for (Var arg : exp.getArgs()) {
+                if (isReference(arg)) {
+                    over.addAll(filterByType(getVarPoints(arg), retType));
+                }
+            }
+            return over;
+        }
+
+        private boolean conservativeArgs(Invoke invoke) {
+            boolean changed = false;
+            List<Var> refs = new ArrayList<>();
+            InvokeExp exp = invoke.getInvokeExp();
+            if (!invoke.isStatic()) {
+                Var base = ((pascal.taie.ir.exp.InvokeInstanceExp) exp).getBase();
+                if (isReference(base)) {
+                    refs.add(base);
+                }
+            }
+            for (Var arg : exp.getArgs()) {
+                if (isReference(arg)) {
+                    refs.add(arg);
+                }
+            }
+            for (Var src : refs) {
+                Set<New> pts = getVarPoints(src);
+                if (pts.isEmpty()) {
+                    pts = allTypedAllocs(src.getType());
+                }
+                for (Var dst : refs) {
+                    if (dst == src) {
+                        continue;
+                    }
+                    changed |= addAll(varPointsTo, dst, filterByType(pts, dst.getType()));
+                }
+            }
+            return changed;
+        }
+
+        private void markConservativeArgs(Invoke invoke) {
+            InvokeExp exp = invoke.getInvokeExp();
+            if (!invoke.isStatic()) {
+                Var base = ((pascal.taie.ir.exp.InvokeInstanceExp) exp).getBase();
+                if (isReference(base)) {
+                    conservativeVars.add(base);
+                }
+            }
+            for (Var arg : exp.getArgs()) {
+                if (isReference(arg)) {
+                    conservativeVars.add(arg);
+                }
+            }
         }
 
         private boolean addArrayStore(New baseObj, Var indexVar, Set<New> values) {
@@ -394,6 +479,23 @@ public class PointerAnalysis extends PointerAnalysisTrivial {
             }
             boolean changed = addFieldPoints(new FieldSlot(baseObj, key), values);
             return changed;
+        }
+
+        private Set<New> candidateBases(Var base) {
+            if (base == null || !isReference(base)) {
+                return Set.of();
+            }
+            Set<New> pts = varPointsTo.get(base);
+            if (pts != null && !pts.isEmpty()) {
+                return pts;
+            }
+            Set<New> res = new HashSet<>();
+            for (New obj : allAllocs) {
+                if (typeCompatible(obj, base.getType())) {
+                    res.add(obj);
+                }
+            }
+            return res;
         }
 
         private Set<New> getArrayPoints(New baseObj, Var indexVar) {
@@ -464,6 +566,32 @@ public class PointerAnalysis extends PointerAnalysisTrivial {
 
         private Set<New> getVarPoints(Var var) {
             return varPointsTo.computeIfAbsent(var, k -> new HashSet<>());
+        }
+
+        private Set<New> pointsOrAny(Var var) {
+            if (!isReference(var)) {
+                return Set.of();
+            }
+            Set<New> pts = varPointsTo.get(var);
+            if (pts != null && !pts.isEmpty()) {
+                return pts;
+            }
+            return allTypedAllocs(var.getType());
+        }
+
+        private Set<New> allTypedAllocs(Type type) {
+            if (!(type instanceof ReferenceType)) {
+                return Set.of();
+            }
+            return allAllocsByType.computeIfAbsent(type, t -> {
+                Set<New> res = new HashSet<>();
+                for (New obj : allAllocs) {
+                    if (typeCompatible(obj, type)) {
+                        res.add(obj);
+                    }
+                }
+                return res;
+            });
         }
 
         private Set<New> getFieldPoints(FieldSlot slot) {

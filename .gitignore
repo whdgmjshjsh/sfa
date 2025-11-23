@@ -1,3 +1,5 @@
 judge/
 *.pdf
 .DS_Store
+Reference/
+.gradle/
